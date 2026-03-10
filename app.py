@@ -165,19 +165,21 @@ if uploaded_files:
             with col2:
                 model_type = st.selectbox("Trend Model Type", ["Linear Trend", "Seasonal Decomposition (STL)"], key=f"model_{station_name}")
             with col3:
-                fill_method = st.selectbox("Gap Filling Method", ["None", "Linear Interpolation", "Forward Fill"], index=1, key=f"fill_{station_name}")
+                model_smoothness = st.slider("Model Smoothness (higher = stiffer line)", 5, 151, 35, 10, key=f"smooth_{station_name}")
             
             # 3.2 SENSITIVITY & OUTLIER METHOD
-            out_col1, out_col2 = st.columns(2)
+            out_col1, out_col2, out_col3 = st.columns([1, 1, 2])
             with out_col1:
-                outlier_method = st.selectbox("Outlier Detection Method", ["Z-Score", "IQR", "Hampel Filter", "Isolation Forest", "DBSCAN"], key=f"method_{station_name}")
+                fill_method = st.selectbox("Gap Filling", ["None", "Linear Interpolation", "Forward Fill"], index=1, key=f"fill_{station_name}")
             with out_col2:
+                outlier_method = st.selectbox("Detection Method", ["Z-Score", "IQR", "Hampel Filter", "Isolation Forest"], key=f"method_{station_name}")
+            with out_col3:
                 if outlier_method == "Z-Score":
-                    threshold = st.slider("Z-Score Threshold", 2.0, 10.0, 3.5, 0.5, key=f"thresh_{station_name}")
+                    threshold = st.slider("Z-Threshold", 1.5, 7.0, 3.0, 0.5, key=f"thresh_{station_name}")
                 elif outlier_method == "IQR":
-                    threshold = st.slider("IQR Multiplier", 1.0, 5.0, 1.5, 0.5, key=f"thresh_{station_name}")
+                    threshold = st.slider("IQR Multiplier", 0.5, 4.0, 1.2, 0.1, key=f"thresh_{station_name}")
                 elif outlier_method == "Hampel Filter":
-                    threshold = st.slider("Sigma Threshold", 2.0, 10.0, 3.0, 0.5, key=f"thresh_{station_name}")
+                    threshold = st.slider("Sigma", 1.5, 6.0, 3.0, 0.5, key=f"thresh_{station_name}")
                 else:
                     threshold = 3.0
 
@@ -185,6 +187,12 @@ if uploaded_files:
             full_mjd = np.arange(work_df['mjd'].min(), work_df['mjd'].max() + 1)
             work_df = work_df.reset_index().set_index('mjd').reindex(full_mjd)
             work_df['is_interpolated'] = work_df[col_select].isna()
+            
+            # Explicitly convert numeric columns before interpolation
+            numeric_cols_fix = [col_select, sig_col, 'dec_year']
+            for c in numeric_cols_fix:
+                if c in work_df.columns:
+                    work_df[c] = pd.to_numeric(work_df[c], errors='coerce')
             
             if fill_method == "Linear Interpolation":
                 work_df = work_df.interpolate(method='linear')
@@ -194,63 +202,71 @@ if uploaded_files:
             if work_df['dec_year'].isna().any():
                 work_df['dec_year'] = work_df['dec_year'].interpolate(method='linear')
             
-            # 5. TRENDING / DECOMPOSITION
+            # 5. ADVANCED TWO-STAGE OUTLIER DETECTION
             data_mean = work_df[col_select].mean()
             data_raw_mm = (work_df[col_select] - data_mean) * 1000
             obs_mask = ~work_df['is_interpolated']
-            wrms_before = calculate_wrms(data_raw_mm[obs_mask], work_df.loc[obs_mask, sig_col] * 1000)
             
-            if model_type == "Linear Trend":
-                z = np.polyfit(work_df['dec_year'], data_raw_mm, 1)
-                p = np.poly1d(z)
-                work_df['trend_mm'] = p(work_df['dec_year'])
-                work_df['seasonal_mm'] = 0
-                work_df['residual_mm'] = data_raw_mm - work_df['trend_mm']
-                model_label = "Linear Trend"
-            else:
-                try:
-                    period = 365
-                    if len(work_df) < period * 2:
-                        period = max(3, (len(work_df) // 2) // 2 * 2 + 1)
-                    stl = STL(data_raw_mm, period=period, robust=True)
-                    res = stl.fit()
-                    work_df['trend_mm'] = res.trend
-                    work_df['seasonal_mm'] = res.seasonal
-                    work_df['residual_mm'] = res.resid
-                except Exception as e:
-                    st.warning(f"STL failed: {e}")
-                    z = np.polyfit(work_df['dec_year'], data_raw_mm, 1)
-                    p = np.poly1d(z)
-                    work_df['trend_mm'] = p(work_df['dec_year'])
-                    work_df['seasonal_mm'] = 0
-                    work_df['residual_mm'] = data_raw_mm - work_df['trend_mm']
-                model_label = "Trend+Seasonal"
-
-            # 6. OUTLIER DETECTION
-            target_data = work_df['residual_mm'].fillna(0)
+            # STAGE 1: ROLLING MEDIAN BASELINE (immune to spikes)
+            detection_baseline = data_raw_mm.rolling(window=91, center=True, min_periods=1).median()
+            detection_baseline = detection_baseline.ffill().bfill()
+            residuals_for_detection = data_raw_mm - detection_baseline
+            
+            # STAGE 2: Run Detection
             if outlier_method == "Z-Score":
-                outliers = get_outliers_zscore(target_data, threshold=threshold)
+                outliers = get_outliers_zscore(residuals_for_detection, threshold=threshold)
             elif outlier_method == "IQR":
-                outliers = get_outliers_iqr(target_data, k=threshold)
+                outliers = get_outliers_iqr(residuals_for_detection, k=threshold)
             elif outlier_method == "Hampel Filter":
-                outliers = get_outliers_hampel(target_data, n_sigmas=threshold)
-            elif outlier_method == "Isolation Forest":
-                outliers = get_outliers_iso_forest(target_data)
+                outliers = get_outliers_hampel(data_raw_mm, n_sigmas=threshold, window_size=26)
             else:
-                outliers = get_outliers_dbscan(target_data)
+                outliers = get_outliers_iso_forest(residuals_for_detection)
                 
             work_df['is_outlier'] = outliers
             num_outliers = outliers.sum()
             
-            clean_df = work_df[~work_df['is_outlier']]
-            wrms_after = calculate_wrms(clean_df[col_select] * 1000 - (data_mean * 1000), 
-                                       clean_df[sig_col] * 1000, 
-                                       model_fit=(clean_df['trend_mm'] + clean_df['seasonal_mm']))
+            # STAGE 3: Final Analysis on CLEANED data
+            clean_df = work_df[~work_df['is_outlier']].copy()
+            clean_full_mm = data_raw_mm.copy()
+            clean_full_mm[work_df['is_outlier']] = np.nan
+            clean_full_mm = clean_full_mm.interpolate(method='linear').ffill().bfill()
             
-            # 6.5 VELOCITY CALCULATION
-            clean_data_mm = (clean_df[col_select] - data_mean) * 1000
-            z_vel = np.polyfit(clean_df['dec_year'], clean_data_mm, 1)
-            velocity_mmyr = z_vel[0]
+            if model_type == "Linear Trend":
+                z_final = np.polyfit(work_df['dec_year'], clean_full_mm, 1)
+                p_final = np.poly1d(z_final)
+                work_df['trend_mm'] = p_final(work_df['dec_year'])
+                work_df['seasonal_mm'] = 0
+                model_label = "Linear Trend"
+            else:
+                try:
+                    period = 365
+                    if len(clean_full_mm) < period * 2:
+                        period = max(3, (len(clean_full_mm) // 2) // 2 * 2 + 1)
+                    
+                    sw = model_smoothness if model_smoothness % 2 != 0 else model_smoothness + 1
+                    stl = STL(clean_full_mm, period=period, seasonal=sw, robust=True)
+                    res = stl.fit()
+                    work_df['trend_mm'] = res.trend
+                    work_df['seasonal_mm'] = res.seasonal
+                except Exception as e:
+                    st.warning(f"STL failed: {e}")
+                    z_f = np.polyfit(work_df['dec_year'], clean_full_mm, 1)
+                    p_f = np.poly1d(z_f)
+                    work_df['trend_mm'] = p_f(work_df['dec_year'])
+                    work_df['seasonal_mm'] = 0
+                model_label = "Trend+Seasonal"
+
+            # Final Residuals for WRMS Calculation
+            work_df['residual_mm'] = data_raw_mm - (work_df['trend_mm'] + work_df['seasonal_mm'])
+            wrms_before = calculate_wrms(data_raw_mm[obs_mask], work_df.loc[obs_mask, sig_col] * 1000)
+            
+            clean_mask = (~work_df['is_outlier']) & obs_mask
+            wrms_after = calculate_wrms(work_df.loc[clean_mask, 'residual_mm'], 
+                                       work_df.loc[clean_mask, sig_col] * 1000)
+            
+            # Velocity Calculation
+            velocity_mmyr = np.polyfit(work_df.loc[~work_df['is_outlier'], 'dec_year'], 
+                                       clean_full_mm[~work_df['is_outlier']], 1)[0]
             
             st.success(f"🚀 **Estimated Plate Velocity ({comp_base.capitalize()}):** {velocity_mmyr:.3f} mm/yr")
             
