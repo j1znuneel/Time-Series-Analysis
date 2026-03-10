@@ -112,7 +112,7 @@ def calculate_wrms(data, sigma, model_fit=None):
     wrms = np.sqrt(np.sum(w * (res**2)) / np.sum(w))
     return wrms
 
-st.title("🛰️ GNSS Time Series Redundancy Killer")
+st.title("🛰️ GNSS Time Series Analysis")
 st.markdown("""
 Upload your `.tenv3` files to analyze GNSS position time series.
 """)
